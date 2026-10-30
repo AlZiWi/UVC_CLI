@@ -69,15 +69,13 @@ List connected cameras:
 Capture a camera by its product or serial name:
 
 ```sh
-./build/libuvc_util -name "Camera Name" -out frames
+./build/libuvc_util "Camera Name" -out=frames
 ```
 
 When built with `UVC_ENABLE_PREVIEW=ON`, display the stream with metadata:
 
 ```sh
-./build-preview/libuvc_util -name "Camera Name" -preview
+./build-preview/libuvc_util "Camera Name" -preview
 ```
 
-Use `./build/libuvc_util -name "Camera Name"` without `-preview` for
-headless capture. The `-stream`, `-debug`, resolution, frame-rate, trigger,
-and exposure options are also available.
+Press Q to quit the preview.

@@ -70,21 +70,22 @@ static int create_output_directory(const char *path) {
 
 static void usage(const char *program) {
   fprintf(stderr,
-      "Usage: %s -name <camera_name> [options]\n"
-      "  -list                List available cameras\n"
-      "  -resx <pixels>       Requested width\n"
-      "  -resy <pixels>       Requested height\n"
-      "  -fps <fps>           Requested frame rate\n"
-      "  -out <folder_path>   Save frames to this folder\n"
-      "  -stream              Write binary frame records to stdout\n"
-      "  -debug               Print initialization and streaming diagnostics\n"
-      "  -trigger <true|false> Set autofocus/trigger control state\n"
-      "  -exposure <auto|units> Set exposure; units are 0.0001 seconds\n"
+      "Usage: %s <camera_name> [options]\n"
+      "  -list                   List available cameras\n"
+      "  -resx=<pixels>          Requested width\n"
+      "  -resy=<pixels>          Requested height\n"
+      "  -fps=<fps>              Requested frame rate\n"
+      "  -out=<folder_path>      Save frames to this folder\n"
+      "  -stream                 Write binary frame records to stdout\n"
+      "  -debug                  Print initialization and streaming diagnostics\n"
+      "  -trigger                Enable autofocus/trigger control state\n"
+      "  -exposure=<auto|units>  Set exposure; units are 0.0001 seconds\n"
     #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
-      "  -preview              Display the image stream with metadata\n"
+      "  -preview                Display the image stream with metadata\n"
     #endif
       "\n"
-      "Camera name is matched exactly against the product or serial name.\n",
+      "Camera name is matched exactly against the product or serial name.\n"
+      "Use -list without a camera name to list available cameras.\n",
       program);
 }
 
@@ -121,72 +122,59 @@ static int parse_exposure(const char *value, uint32_t *exposure, int *auto_mode)
   return 1;
 }
 
+static int option_value(const char *argument, const char *option,
+    const char **value) {
+  size_t option_length = strlen(option);
+
+  if (strncmp(argument, option, option_length) ||
+      argument[option_length] != '=' || argument[option_length + 1] == '\0')
+    return 0;
+  *value = argument + option_length + 1;
+  return 1;
+}
+
 static int parse_options(int argc, char **argv, capture_options_t *options) {
   int index;
+  const char *value;
 
   memset(options, 0, sizeof(*options));
   for (index = 1; index < argc; ++index) {
-    if (!strcmp(argv[index], "-name") || !strcmp(argv[index], "-out") ||
-        !strcmp(argv[index], "-resx") || !strcmp(argv[index], "-resy") ||
-        !strcmp(argv[index], "-fps")) {
-      if (index + 1 >= argc) {
-        fprintf(stderr, "Missing value for %s\n", argv[index]);
-        return 0;
-      }
-      if (!strcmp(argv[index], "-name")) {
-        options->name = argv[++index];
-      } else if (!strcmp(argv[index], "-out")) {
-        options->out_dir = argv[++index];
-      } else if (!strcmp(argv[index], "-resx")) {
-        if (!parse_positive_int(argv[++index], &options->width)) return 0;
-      } else if (!strcmp(argv[index], "-resy")) {
-        if (!parse_positive_int(argv[++index], &options->height)) return 0;
-      } else {
-        if (!parse_positive_int(argv[++index], &options->fps)) return 0;
-      }
-    } else if (!strcmp(argv[index], "-debug") || !strcmp(argv[index], "--debug")) {
+    if (index == 1 && argv[index][0] != '-') {
+      options->name = argv[index];
+    } else if (option_value(argv[index], "-out", &value)) {
+      options->out_dir = value;
+    } else if (option_value(argv[index], "-resx", &value)) {
+      if (!parse_positive_int(value, &options->width)) return 0;
+    } else if (option_value(argv[index], "-resy", &value)) {
+      if (!parse_positive_int(value, &options->height)) return 0;
+    } else if (option_value(argv[index], "-fps", &value)) {
+      if (!parse_positive_int(value, &options->fps)) return 0;
+    } else if (!strcmp(argv[index], "-debug")) {
       options->debug = 1;
     } else if (!strcmp(argv[index], "-stream")) {
       options->stream = 1;
     } else if (!strcmp(argv[index], "-list")) {
       options->list = 1;
     } else if (!strcmp(argv[index], "-trigger")) {
-      if (index + 1 >= argc) {
-        fprintf(stderr, "Missing value for -trigger (expected true or false)\n");
-        return 0;
-      }
-      if (!strcmp(argv[++index], "true")) {
-        options->trigger = 1;
-      } else if (!strcmp(argv[index], "false")) {
-        options->trigger = 0;
-      } else {
-        fprintf(stderr, "Invalid value for -trigger: %s (expected true or false)\n",
-            argv[index]);
-        return 0;
-      }
+      options->trigger = 1;
       options->trigger_specified = 1;
-    } else if (!strcmp(argv[index], "-exposure")) {
-      if (index + 1 >= argc) {
-        fprintf(stderr, "Missing value for -exposure (expected auto or a positive 0.0001-second unit value)\n");
-        return 0;
-      }
-      if (!parse_exposure(argv[++index], &options->exposure, &options->exposure_auto))
+    } else if (option_value(argv[index], "-exposure", &value)) {
+      if (!parse_exposure(value, &options->exposure, &options->exposure_auto))
         return 0;
       options->exposure_specified = 1;
-    }
   #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
-    else if (!strcmp(argv[index], "-preview")) {
+    } else if (!strcmp(argv[index], "-preview")) {
       options->preview = 1;
-    }
   #endif
-    else {
-      fprintf(stderr, "Unknown argument: %s\n", argv[index]);
+    } else {
+      fprintf(stderr, "Unknown or malformed argument: %s (expected -arg=value)\n",
+          argv[index]);
       return 0;
     }
   }
 
   if (!options->name && !options->list) {
-    fprintf(stderr, "-name is required\n");
+    fprintf(stderr, "camera name is required\n");
     return 0;
   }
   return 1;
