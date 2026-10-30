@@ -1,0 +1,598 @@
+#include "libuvc/libuvc.h"
+#if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+#include "preview.h"
+#endif
+
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
+//cmake --build ./build --target libuvc_util
+
+static volatile sig_atomic_t keep_running = 1;
+
+typedef struct capture_options {
+  const char *name;
+  const char *out_dir;
+  int debug;
+  int width;
+  int height;
+  int fps;
+  int stream;
+  int list;
+  int trigger;
+  int trigger_specified;
+  uint32_t exposure;
+  int exposure_auto;
+  int exposure_specified;
+#if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+  int preview;
+#endif
+} capture_options_t;
+
+static void debug_log(const capture_options_t *options, const char *message) {
+  if (options->debug)
+    fprintf(stderr, "[debug] %s\n", message);
+}
+
+typedef struct stream_record_header {
+  char magic[4];
+  uint32_t frame_id;
+  uint64_t timestamp_seconds;
+  uint32_t timestamp_milliseconds;
+  uint32_t width;
+  uint32_t height;
+  uint32_t frame_format;
+  uint64_t frame_bytes;
+  uint64_t metadata_bytes;
+} stream_record_header_t;
+
+static void stop_handler(int signal_number) {
+  (void)signal_number;
+  keep_running = 0;
+}
+
+static int create_output_directory(const char *path) {
+#ifdef _WIN32
+  return _mkdir(path);
+#else
+  return mkdir(path, 0777);
+#endif
+}
+
+static void usage(const char *program) {
+  fprintf(stderr,
+      "Usage: %s -name <camera_name> [options]\n"
+      "  -list                List available cameras\n"
+      "  -resx <pixels>       Requested width\n"
+      "  -resy <pixels>       Requested height\n"
+      "  -fps <fps>           Requested frame rate\n"
+      "  -out <folder_path>   Save frames to this folder\n"
+      "  -stream              Write binary frame records to stdout\n"
+      "  -debug               Print initialization and streaming diagnostics\n"
+      "  -trigger <true|false> Set autofocus/trigger control state\n"
+      "  -exposure <auto|units> Set exposure; units are 0.0001 seconds\n"
+    #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+      "  -preview              Display the image stream with metadata\n"
+    #endif
+      "\n"
+      "Camera name is matched exactly against the product or serial name.\n",
+      program);
+}
+
+static int parse_positive_int(const char *value, int *result) {
+  char *end;
+  long parsed;
+
+  errno = 0;
+  parsed = strtol(value, &end, 10);
+  if (errno || *value == '\0' || *end != '\0' || parsed <= 0 || parsed > INT32_MAX)
+    return 0;
+  *result = (int)parsed;
+  return 1;
+}
+
+static int parse_exposure(const char *value, uint32_t *exposure, int *auto_mode) {
+  char *end;
+  unsigned long long parsed;
+
+  if (!strcmp(value, "auto")) {
+    *auto_mode = 1;
+    return 1;
+  }
+
+  errno = 0;
+  parsed = strtoull(value, &end, 10);
+  if (errno || *value == '\0' || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+    fprintf(stderr, "Invalid exposure: %s (expected auto or a positive 0.0001-second unit value)\n",
+        value);
+    return 0;
+  }
+  *exposure = (uint32_t)parsed;
+  *auto_mode = 0;
+  return 1;
+}
+
+static int parse_options(int argc, char **argv, capture_options_t *options) {
+  int index;
+
+  memset(options, 0, sizeof(*options));
+  for (index = 1; index < argc; ++index) {
+    if (!strcmp(argv[index], "-name") || !strcmp(argv[index], "-out") ||
+        !strcmp(argv[index], "-resx") || !strcmp(argv[index], "-resy") ||
+        !strcmp(argv[index], "-fps")) {
+      if (index + 1 >= argc) {
+        fprintf(stderr, "Missing value for %s\n", argv[index]);
+        return 0;
+      }
+      if (!strcmp(argv[index], "-name")) {
+        options->name = argv[++index];
+      } else if (!strcmp(argv[index], "-out")) {
+        options->out_dir = argv[++index];
+      } else if (!strcmp(argv[index], "-resx")) {
+        if (!parse_positive_int(argv[++index], &options->width)) return 0;
+      } else if (!strcmp(argv[index], "-resy")) {
+        if (!parse_positive_int(argv[++index], &options->height)) return 0;
+      } else {
+        if (!parse_positive_int(argv[++index], &options->fps)) return 0;
+      }
+    } else if (!strcmp(argv[index], "-debug") || !strcmp(argv[index], "--debug")) {
+      options->debug = 1;
+    } else if (!strcmp(argv[index], "-stream")) {
+      options->stream = 1;
+    } else if (!strcmp(argv[index], "-list")) {
+      options->list = 1;
+    } else if (!strcmp(argv[index], "-trigger")) {
+      if (index + 1 >= argc) {
+        fprintf(stderr, "Missing value for -trigger (expected true or false)\n");
+        return 0;
+      }
+      if (!strcmp(argv[++index], "true")) {
+        options->trigger = 1;
+      } else if (!strcmp(argv[index], "false")) {
+        options->trigger = 0;
+      } else {
+        fprintf(stderr, "Invalid value for -trigger: %s (expected true or false)\n",
+            argv[index]);
+        return 0;
+      }
+      options->trigger_specified = 1;
+    } else if (!strcmp(argv[index], "-exposure")) {
+      if (index + 1 >= argc) {
+        fprintf(stderr, "Missing value for -exposure (expected auto or a positive 0.0001-second unit value)\n");
+        return 0;
+      }
+      if (!parse_exposure(argv[++index], &options->exposure, &options->exposure_auto))
+        return 0;
+      options->exposure_specified = 1;
+    }
+  #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+    else if (!strcmp(argv[index], "-preview")) {
+      options->preview = 1;
+    }
+  #endif
+    else {
+      fprintf(stderr, "Unknown argument: %s\n", argv[index]);
+      return 0;
+    }
+  }
+
+  if (!options->name && !options->list) {
+    fprintf(stderr, "-name is required\n");
+    return 0;
+  }
+  return 1;
+}
+
+static uvc_error_t list_devices(uvc_context_t *ctx) {
+  uvc_device_t **devices;
+  uvc_error_t result;
+  size_t index;
+
+  result = uvc_get_device_list(ctx, &devices);
+  if (result < 0) return result;
+
+  printf("Available UVC devices:\n");
+  for (index = 0; devices[index]; ++index) {
+    uvc_device_descriptor_t *descriptor = NULL;
+
+    if (uvc_get_device_descriptor(devices[index], &descriptor) != UVC_SUCCESS)
+      continue;
+    printf("[%zu] product=\"%s\" serial=\"%s\" manufacturer=\"%s\" vid=0x%04x pid=0x%04x\n",
+      index, descriptor->product ? descriptor->product : "[none]",
+      descriptor->serialNumber ? descriptor->serialNumber : "[none]",
+      descriptor->manufacturer ? descriptor->manufacturer : "[none]",
+        descriptor->idVendor, descriptor->idProduct);
+    uvc_free_device_descriptor(descriptor);
+  }
+
+  uvc_free_device_list(devices, 1);
+  return UVC_SUCCESS;
+}
+
+static uvc_error_t find_named_device(uvc_context_t *ctx, const char *name,
+    uvc_device_t **device) {
+  uvc_device_t **devices;
+  uvc_error_t result;
+  size_t index;
+
+  result = uvc_get_device_list(ctx, &devices);
+  if (result < 0) return result;
+
+  for (index = 0; devices[index]; ++index) {
+    uvc_device_descriptor_t *descriptor = NULL;
+    int matches = 0;
+
+    if (uvc_get_device_descriptor(devices[index], &descriptor) == UVC_SUCCESS) {
+      matches = (descriptor->product && !strcmp(descriptor->product, name)) ||
+          (descriptor->serialNumber && !strcmp(descriptor->serialNumber, name));
+      uvc_free_device_descriptor(descriptor);
+    }
+    if (matches) {
+      uvc_ref_device(devices[index]);
+      *device = devices[index];
+      uvc_free_device_list(devices, 1);
+      return UVC_SUCCESS;
+    }
+  }
+
+  uvc_free_device_list(devices, 1);
+  return UVC_ERROR_NO_DEVICE;
+}
+
+static enum uvc_frame_format format_for_descriptor(const uvc_format_desc_t *format) {
+  switch (format->bDescriptorSubtype) {
+    case UVC_VS_FORMAT_MJPEG: return UVC_COLOR_FORMAT_MJPEG;
+    case UVC_VS_FORMAT_FRAME_BASED: return UVC_FRAME_FORMAT_H264;
+    default: return UVC_FRAME_FORMAT_YUYV;
+  }
+}
+
+static unsigned frame_timestamp_seconds(const uvc_frame_t *frame) {
+  return (unsigned)(frame->capture_time_finished.tv_sec % 10000);
+}
+
+static unsigned frame_timestamp_milliseconds(const uvc_frame_t *frame) {
+  return (unsigned)(frame->capture_time_finished.tv_nsec / 1000000);
+}
+
+static int save_frame(const capture_options_t *options, const uvc_frame_t *frame) {
+  char filename[512];
+  FILE *file;
+  unsigned seconds = frame_timestamp_seconds(frame);
+  unsigned milliseconds = frame_timestamp_milliseconds(frame);
+
+  if (!options->out_dir) return 1;
+  if (snprintf(filename, sizeof(filename), "%s/frame_%06u__%04u_%03u.jpg",
+      options->out_dir, frame->sequence, seconds, milliseconds) >= (int)sizeof(filename)) {
+    fprintf(stderr, "Output path is too long\n");
+    return 0;
+  }
+  file = fopen(filename, "wb");
+  if (!file) {
+    perror(filename);
+    return 0;
+  }
+  if (fwrite(frame->data, 1, frame->data_bytes, file) != frame->data_bytes) {
+    perror(filename);
+    fclose(file);
+    return 0;
+  }
+  fclose(file);
+  return 1;
+}
+
+static int stream_frame(const uvc_frame_t *frame) {
+  stream_record_header_t header = {{'U', 'V', 'C', 'F'}, frame->sequence,
+  (uint64_t)frame->capture_time_finished.tv_sec,
+  frame_timestamp_milliseconds(frame), frame->width, frame->height,
+      (uint32_t)frame->frame_format, frame->data_bytes, frame->metadata_bytes};
+
+  if (fwrite(&header, sizeof(header), 1, stdout) != 1 ||
+      fwrite(frame->data, 1, frame->data_bytes, stdout) != frame->data_bytes ||
+      (frame->metadata_bytes && fwrite(frame->metadata, 1, frame->metadata_bytes, stdout) != frame->metadata_bytes))
+    return 0;
+  return fflush(stdout) == 0;
+}
+
+int main(int argc, char **argv) {
+  capture_options_t options;
+  uvc_context_t *context = NULL;
+  uvc_device_t *device = NULL;
+  uvc_device_handle_t *device_handle = NULL;
+  uvc_stream_handle_t *stream = NULL;
+  uvc_stream_ctrl_t control;
+  const uvc_input_terminal_t *camera_terminal;
+  const uvc_format_desc_t *format;
+  const uvc_frame_desc_t *frame_desc;
+  enum uvc_frame_format frame_format;
+  uvc_error_t result;
+  int width = 0;
+  int height = 0;
+  int fps = 0;
+  int exit_code = 1;
+
+
+  if (!parse_options(argc, argv, &options)) {
+    usage(argv[0]);
+    return 2;
+  }
+
+  debug_log(&options, "arguments parsed");
+
+  if (options.out_dir && create_output_directory(options.out_dir) && errno != EEXIST) {
+    perror(options.out_dir);
+    return 2;
+  }
+
+  signal(SIGINT, stop_handler);
+  signal(SIGTERM, stop_handler);
+
+  debug_log(&options, "initializing libuvc");
+  result = uvc_init(&context, NULL);
+  if (result < 0) {
+    fprintf(stderr, "uvc_init failed with error code %d\n", result);
+    uvc_perror(result, "uvc_init");
+    return 1;
+  }
+  debug_log(&options, "libuvc initialized");
+  if (options.list) {
+    debug_log(&options, "enumerating cameras");
+    result = list_devices(context);
+    if (result < 0) {
+      uvc_perror(result, "list_devices");
+      goto cleanup;
+    }
+    if (!options.name) {
+      exit_code = 0;
+      goto cleanup;
+    }
+  }
+  debug_log(&options, "looking up requested camera");
+  result = find_named_device(context, options.name, &device);
+  if (result < 0) {
+    fprintf(stderr, "camera not found: %s\n", options.name);
+    uvc_perror(result, "find_named_device");
+    goto cleanup;
+  }
+  debug_log(&options, "opening camera");
+  result = uvc_open(device, &device_handle);
+  if (result < 0) {
+    fprintf(stderr, "uvc_open failed with error code %d\n", result);
+    uvc_perror(result, "uvc_open");
+    goto cleanup;
+  }
+  camera_terminal = uvc_get_camera_terminal(device_handle);
+  // print bmcontrols to debug log for troubleshooting
+  if (options.debug && camera_terminal) {
+    fprintf(stderr, "[debug] camera terminal controls: 0x%016llx\n", (unsigned long long)camera_terminal->bmControls);
+  }
+  static const uint8_t UVC_BMCONTROLS_CT_FOCUS_AUTO_CONTROL_BIT = 17;  // Bit position from end for UVC_CT_FOCUS_AUTO_CONTROL in bmControls, CT D18 according to UVC 1.5 spec, 0-based index in little-endian. This is used to check if the camera supports autofocus/trigger control.
+  static const uint8_t UVC_BMCONTROLS_CT_AUTO_EXPOSURE_MODE_CONTROL_BIT = 1;
+  static const uint8_t UVC_BMCONTROLS_CT_EXPOSURE_TIME_ABS_CONTROL_BIT = 3;
+  static const uint8_t UVC_AE_MODE_MANUAL = 1;
+  static const uint8_t UVC_AE_MODE_AUTO = 8; // other modes (2, 4) might not be supported.
+
+  format = uvc_get_format_descs(device_handle);
+  if (!format || !format->frame_descs) {
+    fprintf(stderr, "Camera has no stream format\n");
+    goto cleanup;
+  }
+  frame_desc = format->frame_descs;
+  width = options.width ? options.width : frame_desc->wWidth;
+  height = options.height ? options.height : frame_desc->wHeight;
+  fps = options.fps ? options.fps : (int)(10000000 / frame_desc->dwDefaultFrameInterval);
+  frame_format = format_for_descriptor(format);
+  if (options.debug) {
+    fprintf(stderr, "[debug] requested stream: %dx%d at %d fps, format %d\n",
+        width, height, fps, frame_format);
+  }
+
+  // EXPOSURE CONTROL
+
+  if (options.exposure_specified && camera_terminal &&
+      (camera_terminal->bmControls & (1ULL << (UVC_BMCONTROLS_CT_AUTO_EXPOSURE_MODE_CONTROL_BIT)))) {
+    uint32_t exposure_min;
+    uint32_t exposure_max;
+    uint32_t exposure_res;
+
+    if (!camera_terminal) {
+      fprintf(stderr, "Camera has no camera terminal for exposure control\n");
+      goto cleanup;
+    }
+
+    if (options.debug) {
+      uint8_t current_ae_mode;
+      uint32_t current_exposure;
+
+      result = uvc_get_ae_mode(device_handle, &current_ae_mode, UVC_GET_CUR);
+      if (result < 0) {
+        fprintf(stderr, "[debug] could not get current auto-exposure mode (error %d)\n",
+            result);
+      } else {
+        fprintf(stderr, "[debug] current auto-exposure mode: %u\n", current_ae_mode);
+      }
+
+      result = uvc_get_exposure_abs(device_handle, &current_exposure, UVC_GET_CUR);
+      if (result < 0) {
+        fprintf(stderr, "[debug] could not get current exposure time (error %d)\n",
+            result);
+      } else {
+        fprintf(stderr, "[debug] current exposure time: %u (0.0001-second units)\n",
+            current_exposure);
+      }
+    }
+
+    if (options.exposure_auto) {
+      debug_log(&options, "enabling auto-exposure mode");
+      result = uvc_set_ae_mode(device_handle, UVC_AE_MODE_AUTO);
+      if (result < 0) {
+        fprintf(stderr, "Could not enable auto-exposure mode (error %d)\n", result);
+        uvc_perror(result, "uvc_set_ae_mode");
+        goto cleanup;
+      }
+    } else {
+      result = uvc_get_exposure_abs(device_handle, &exposure_min, UVC_GET_MIN);
+      if (result < 0) {
+        fprintf(stderr, "Could not get minimum exposure (error %d)\n", result);
+        uvc_perror(result, "uvc_get_exposure_abs(GET_MIN)");
+        goto cleanup;
+      }
+      result = uvc_get_exposure_abs(device_handle, &exposure_max, UVC_GET_MAX);
+      if (result < 0) {
+        fprintf(stderr, "Could not get maximum exposure (error %d)\n", result);
+        uvc_perror(result, "uvc_get_exposure_abs(GET_MAX)");
+        goto cleanup;
+      }
+      result = uvc_get_exposure_abs(device_handle, &exposure_res, UVC_GET_RES);
+      if (result < 0) {
+        fprintf(stderr, "Could not get exposure resolution (error %d)\n", result);
+        uvc_perror(result, "uvc_get_exposure_abs(GET_RES)");
+        goto cleanup;
+      }
+      if (exposure_min > exposure_max || options.exposure < exposure_min ||
+          options.exposure > exposure_max ||
+          (exposure_res && (options.exposure - exposure_min) % exposure_res)) {
+        fprintf(stderr,
+            "Exposure %u is outside the camera range or resolution: "
+            "min=%u max=%u resolution=%u (0.0001-second units)\n",
+            options.exposure, exposure_min, exposure_max, exposure_res);
+        goto cleanup;
+      }
+      if (options.debug) {
+        fprintf(stderr, "[debug] exposure range: min=%u max=%u resolution=%u\n",
+            exposure_min, exposure_max, exposure_res);
+      }
+      result = uvc_set_ae_mode(device_handle, UVC_AE_MODE_MANUAL);
+      if (result < 0) {
+        fprintf(stderr, "Could not enable manual exposure mode (error %d)\n", result);
+        uvc_perror(result, "uvc_set_ae_mode");
+        goto cleanup;
+      }
+    }
+
+    if (options.debug) {
+      uint8_t current_ae_mode;
+      uint32_t current_exposure;
+
+      result = uvc_get_ae_mode(device_handle, &current_ae_mode, UVC_GET_CUR);
+      if (result < 0) {
+        fprintf(stderr, "[debug] could not get current auto-exposure mode (error %d)\n",
+            result);
+      } else {
+        fprintf(stderr, "[debug] current auto-exposure mode: %u\n", current_ae_mode);
+      }
+
+      result = uvc_get_exposure_abs(device_handle, &current_exposure, UVC_GET_CUR);
+      if (result < 0) {
+        fprintf(stderr, "[debug] could not get current exposure time (error %d)\n",
+            result);
+      } else {
+        fprintf(stderr, "[debug] current exposure time: %u (0.0001-second units)\n",
+            current_exposure);
+      }
+    }
+
+    debug_log(&options, "exposure control set");
+  }
+
+  // TRIGGER CONTROL
+
+  if (options.trigger_specified && camera_terminal &&
+      (camera_terminal->bmControls & (1ULL << (UVC_BMCONTROLS_CT_FOCUS_AUTO_CONTROL_BIT)))) {
+    debug_log(&options, "enabling autofocus/trigger control");
+    result = uvc_set_focus_auto(device_handle, options.trigger);
+    if (result < 0) {
+      fprintf(stderr, "Could not enable autofocus/trigger control (error %d)\n", result);
+      uvc_perror(result, "uvc_set_focus_auto");
+      goto cleanup;
+    }
+    debug_log(&options, "autofocus/trigger control set");
+  } else if (options.trigger_specified) {
+    fprintf(stderr, "Camera does not advertise autofocus/trigger control; skipping request\n");
+  }
+
+  // STREAM SETUP
+
+  result = uvc_get_stream_ctrl_format_size(device_handle, &control, frame_format,
+      width, height, fps);
+  if (result < 0) {
+    uvc_perror(result, "uvc_get_stream_ctrl_format_size");
+    goto cleanup;
+  }
+  result = uvc_stream_open_ctrl(device_handle, &stream, &control);
+  if (result < 0) {
+    uvc_perror(result, "uvc_stream_open_ctrl");
+    goto cleanup;
+  }
+  result = uvc_stream_start(stream, NULL, NULL, 0);
+  if (result < 0) {
+    fprintf(stderr, "uvc_stream_start failed with error code %d\n", result);
+    uvc_perror(result, "uvc_stream_start");
+    goto cleanup;
+  }
+  debug_log(&options, "stream started");
+#if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+  if (options.preview && !preview_init("libuvc preview")) {
+    fprintf(stderr, "Could not initialize preview window\n");
+    goto cleanup;
+  }
+#endif
+
+  if (options.exposure_specified && !options.exposure_auto && camera_terminal &&
+      (camera_terminal->bmControls & (1ULL << (UVC_BMCONTROLS_CT_EXPOSURE_TIME_ABS_CONTROL_BIT)))) {
+    debug_log(&options, "setting exposure time");
+    result = uvc_set_exposure_abs(device_handle, options.exposure);
+    if (result < 0) {
+      fprintf(stderr, "Could not set exposure to %u (error %d)\n",
+          options.exposure, result);
+      uvc_perror(result, "uvc_set_exposure_abs");
+      goto cleanup;
+    }
+  }
+
+  // Loop
+
+  while (keep_running) {
+    uvc_frame_t *frame = NULL;
+    result = uvc_stream_get_frame(stream, &frame, 100000);
+    if (result == UVC_ERROR_TIMEOUT) continue;
+    if (result < 0) {
+      uvc_perror(result, "uvc_stream_get_frame");
+      break;
+    }
+    if (!frame) continue;
+    debug_log(&options, "frame received");
+  #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+    if ((options.preview && preview_frame(frame)) ||
+      !save_frame(&options, frame) || (options.stream && !stream_frame(frame))) {
+  #else
+    if (!save_frame(&options, frame) || (options.stream && !stream_frame(frame))) {
+  #endif
+      keep_running = 0;
+      break;
+    }
+  }
+  exit_code = 0;
+
+cleanup:
+#if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
+  if (options.preview) preview_close();
+#endif
+  if (stream) {
+    uvc_stream_stop(stream);
+    uvc_stream_close(stream);
+  }
+  if (device_handle) uvc_close(device_handle);
+  if (device) uvc_unref_device(device);
+  if (context) uvc_exit(context);
+  return exit_code;
+}

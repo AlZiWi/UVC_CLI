@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# CMake build trees
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# macOS metadata
+.DS_Store
