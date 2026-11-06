@@ -78,7 +78,7 @@ static void usage(const char *program) {
       "  -out=<folder_path>      Save frames to this folder\n"
       "  -stream                 Write binary frame records to stdout\n"
       "  -debug                  Print initialization and streaming diagnostics\n"
-      "  -trigger                Enable autofocus/trigger control state\n"
+      "  -trigger=<true|false>   Set autofocus/trigger control state\n"
       "  -exposure=<auto|units>  Set exposure; units are 0.0001 seconds\n"
     #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
       "  -preview                Display the image stream with metadata\n"
@@ -133,6 +133,19 @@ static int option_value(const char *argument, const char *option,
   return 1;
 }
 
+static int parse_boolean(const char *value, int *result) {
+  if (!strcmp(value, "true")) {
+    *result = 1;
+    return 1;
+  }
+  if (!strcmp(value, "false")) {
+    *result = 0;
+    return 1;
+  }
+  fprintf(stderr, "Invalid boolean value: %s (expected true or false)\n", value);
+  return 0;
+}
+
 static int parse_options(int argc, char **argv, capture_options_t *options) {
   int index;
   const char *value;
@@ -155,8 +168,8 @@ static int parse_options(int argc, char **argv, capture_options_t *options) {
       options->stream = 1;
     } else if (!strcmp(argv[index], "-list")) {
       options->list = 1;
-    } else if (!strcmp(argv[index], "-trigger")) {
-      options->trigger = 1;
+    } else if (option_value(argv[index], "-trigger", &value)) {
+      if (!parse_boolean(value, &options->trigger)) return 0;
       options->trigger_specified = 1;
     } else if (option_value(argv[index], "-exposure", &value)) {
       if (!parse_exposure(value, &options->exposure, &options->exposure_auto))
@@ -259,7 +272,7 @@ static int save_frame(const capture_options_t *options, const uvc_frame_t *frame
   unsigned milliseconds = frame_timestamp_milliseconds(frame);
 
   if (!options->out_dir) return 1;
-  if (snprintf(filename, sizeof(filename), "%s/frame_%06u__%04u_%03u.jpg",
+  if (snprintf(filename, sizeof(filename), "%s/frame_%06u_%04u-%03u.jpg",
       options->out_dir, frame->sequence, seconds, milliseconds) >= (int)sizeof(filename)) {
     fprintf(stderr, "Output path is too long\n");
     return 0;
@@ -382,6 +395,11 @@ int main(int argc, char **argv) {
   if (options.debug) {
     fprintf(stderr, "[debug] requested stream: %dx%d at %d fps, format %d\n",
         width, height, fps, frame_format);
+    fprintf(stderr, "[debug] camera stream format: %dx%d at %d fps, format %d\n",
+        frame_desc->wWidth, frame_desc->wHeight,
+        (int)(10000000 / frame_desc->dwDefaultFrameInterval), frame_format);
+    fprintf(stderr, "[debug] dwMaxVideoFrameBufferSize: %d\n",
+        frame_desc->dwMaxVideoFrameBufferSize);
   }
 
   // EXPOSURE CONTROL
@@ -516,6 +534,13 @@ int main(int argc, char **argv) {
     uvc_perror(result, "uvc_get_stream_ctrl_format_size");
     goto cleanup;
   }
+  if (options.debug) {
+    fprintf(stderr,
+      "frame_size=%u payload_size=%u interval=%u\n",
+      control.dwMaxVideoFrameSize,
+      control.dwMaxPayloadTransferSize,
+      control.dwFrameInterval);
+  }
   result = uvc_stream_open_ctrl(device_handle, &stream, &control);
   if (result < 0) {
     uvc_perror(result, "uvc_stream_open_ctrl");
@@ -552,13 +577,24 @@ int main(int argc, char **argv) {
   while (keep_running) {
     uvc_frame_t *frame = NULL;
     result = uvc_stream_get_frame(stream, &frame, 100000);
-    if (result == UVC_ERROR_TIMEOUT) continue;
+    if (result == UVC_ERROR_TIMEOUT) {
+      debug_log(&options, "uvc_stream_get_frame timeout");
+      continue;
+    }
     if (result < 0) {
+      debug_log(&options, "uvc_stream_get_frame failed");
       uvc_perror(result, "uvc_stream_get_frame");
       break;
     }
-    if (!frame) continue;
-    debug_log(&options, "frame received");
+    if (!frame) {
+      debug_log(&options, "uvc_stream_get_frame returned NULL");
+      continue;
+    }
+    if (options.debug) {
+      fprintf(stderr, "[debug] frame %u: %lu bytes, timestamp %u.%03u\n",
+          frame->sequence, (unsigned long)frame->data_bytes,
+          frame_timestamp_seconds(frame), frame_timestamp_milliseconds(frame));
+    }
   #if !defined(_WIN32) && defined(UVC_CLI_HAS_PREVIEW)
     if ((options.preview && preview_frame(frame)) ||
       !save_frame(&options, frame) || (options.stream && !stream_frame(frame))) {

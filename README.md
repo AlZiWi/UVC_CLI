@@ -79,3 +79,7 @@ When built with `UVC_ENABLE_PREVIEW=ON`, display the stream with metadata:
 ```
 
 Press Q to quit the preview.
+
+The trigger option must be explicit (`-trigger=true` or `-trigger=false`).
+When omitted, the camera trigger property is left unchanged. Numeric and
+string options use the `-arg=value` format.
